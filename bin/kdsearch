@@ -1,0 +1,341 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+program_name=$(basename "$0")
+
+usage() {
+  cat <<'EOF'
+Usage:
+  kdsearch [OPTIONS] --range FIELD:LOW:HIGH [--range ...] TREE
+
+Search a kdsplit tree for rows whose fields fall within inclusive ranges.
+
+Options:
+  -t, --field-separator CHAR  Field delimiter (default: tab).
+      --data-file NAME        Data file name in each tree node (default: data).
+      --header                Print TREE/header before matching rows, if present.
+      --quiet                 Suppress pruning summary.
+      --help                  Show this help.
+
+Ranges use 1-based fields. Empty LOW or HIGH leaves that side open:
+  --range 2:6:8      field 2 between 6 and 8
+  --range 14:LAX:LAX field 14 equal to LAX
+  --range 3::15      field 3 <= 15
+
+Numeric comparisons are used for split keys whose kdsplit key definition
+contains GNU sort's n modifier. Other ranges use bytewise string comparison.
+EOF
+}
+
+die() {
+  printf '%s: %s\n' "$program_name" "$*" >&2
+  exit 1
+}
+
+parse_meta_value() {
+  local file=$1
+  local key=$2
+  awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$file"
+}
+
+join_values() {
+  local sep=$1
+  shift
+  local out=
+  local item
+
+  for item in "$@"; do
+    if [[ -z "$out" ]]; then
+      out=$item
+    else
+      out+="${sep}${item}"
+    fi
+  done
+  printf '%s' "$out"
+}
+
+key_field() {
+  local keydef=$1
+  local start=${keydef%%,*}
+
+  if [[ "$start" =~ ^([0-9]+) ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+  else
+    die "cannot extract starting field from key definition: $keydef"
+  fi
+}
+
+key_is_numeric() {
+  local keydef=$1
+  [[ "$keydef" =~ [0-9][.0-9]*[[:alpha:]]*n || "$keydef" =~ ,[^[:space:]]*n ]]
+}
+
+key_is_reverse() {
+  local keydef=$1
+  [[ "$keydef" =~ [0-9][.0-9]*[[:alpha:]]*r || "$keydef" =~ ,[^[:space:]]*r ]]
+}
+
+cmp_lt() {
+  local a=$1
+  local b=$2
+  local numeric=$3
+
+  if [[ "$numeric" -eq 1 ]]; then
+    awk -v a="$a" -v b="$b" 'BEGIN { exit !((a + 0) < (b + 0)) }'
+  else
+    [[ "$a" < "$b" ]]
+  fi
+}
+
+cmp_gt() {
+  local a=$1
+  local b=$2
+  local numeric=$3
+
+  if [[ "$numeric" -eq 1 ]]; then
+    awk -v a="$a" -v b="$b" 'BEGIN { exit !((a + 0) > (b + 0)) }'
+  else
+    [[ "$a" > "$b" ]]
+  fi
+}
+
+range_for_field() {
+  local field=$1
+  local i
+
+  for ((i = 0; i < ${#range_fields[@]}; i++)); do
+    if [[ "${range_fields[$i]}" == "$field" ]]; then
+      printf '%s\t%s\n' "${range_lows[$i]}" "${range_highs[$i]}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+scan_leaf() {
+  local file=$1
+  [[ -f "$file" ]] || return 0
+
+  awk -v FS="$delimiter" \
+    -v fields="$awk_fields" \
+    -v lows="$awk_lows" \
+    -v highs="$awk_highs" \
+    -v nums="$awk_nums" '
+      BEGIN {
+        nf = split(fields, f, "\t")
+        split(lows, lo, "\t")
+        split(highs, hi, "\t")
+        split(nums, num, "\t")
+      }
+      {
+        ok = 1
+        for (i = 1; i <= nf; i++) {
+          v = $(f[i])
+          if (num[i]) {
+            vn = v + 0
+            if (lo[i] != "" && vn < lo[i] + 0) ok = 0
+            if (hi[i] != "" && vn > hi[i] + 0) ok = 0
+          } else {
+            if (lo[i] != "" && v < lo[i]) ok = 0
+            if (hi[i] != "" && v > hi[i]) ok = 0
+          }
+          if (!ok) next
+        }
+        print
+      }
+    ' "$file"
+}
+
+search_node() {
+  local dir=$1
+  local meta="$dir/split.meta"
+  local status
+
+  if [[ ! -f "$meta" ]]; then
+    scanned_leaves=$((scanned_leaves + 1))
+    scan_leaf "$dir/$data_file"
+    return
+  fi
+
+  status=$(parse_meta_value "$meta" status)
+  if [[ "$status" != "split" ]]; then
+    scanned_leaves=$((scanned_leaves + 1))
+    scan_leaf "$dir/$data_file"
+    return
+  fi
+
+  local split_field
+  local keydef
+  local median
+  local left_name
+  local right_name
+  split_field=$(parse_meta_value "$meta" key_field)
+  keydef=$(parse_meta_value "$meta" keydef)
+  median=$(parse_meta_value "$meta" median)
+  left_name=$(parse_meta_value "$meta" left)
+  right_name=$(parse_meta_value "$meta" right)
+
+  local visit_left=1
+  local visit_right=1
+  local bounds
+  local low
+  local high
+  local numeric=0
+
+  if bounds=$(range_for_field "$split_field") && ! key_is_reverse "$keydef"; then
+    low=${bounds%%$'\t'*}
+    high=${bounds#*$'\t'}
+    if key_is_numeric "$keydef"; then
+      numeric=1
+    fi
+
+    # A line-balanced split can cut through duplicate median values, so equality
+    # must visit both sides.
+    if [[ -n "$low" ]] && cmp_gt "$low" "$median" "$numeric"; then
+      visit_left=0
+    fi
+    if [[ -n "$high" ]] && cmp_lt "$high" "$median" "$numeric"; then
+      visit_right=0
+    fi
+  fi
+
+  if [[ "$visit_left" -eq 1 ]]; then
+    visited_nodes=$((visited_nodes + 1))
+    search_node "$dir/$left_name"
+  else
+    pruned_nodes=$((pruned_nodes + 1))
+  fi
+
+  if [[ "$visit_right" -eq 1 ]]; then
+    visited_nodes=$((visited_nodes + 1))
+    search_node "$dir/$right_name"
+  else
+    pruned_nodes=$((pruned_nodes + 1))
+  fi
+}
+
+delimiter=$'\t'
+data_file=data
+print_header=0
+quiet=0
+range_fields=()
+range_lows=()
+range_highs=()
+tree=
+
+while (($# > 0)); do
+  case "$1" in
+    -t|--field-separator)
+      (($# >= 2)) || die "$1 requires a delimiter"
+      delimiter=$2
+      [[ ${#delimiter} -eq 1 ]] || die "field separator must be a single character"
+      shift 2
+      ;;
+    -t?*)
+      delimiter=${1#-t}
+      [[ ${#delimiter} -eq 1 ]] || die "field separator must be a single character"
+      shift
+      ;;
+    --field-separator=*)
+      delimiter=${1#--field-separator=}
+      [[ ${#delimiter} -eq 1 ]] || die "field separator must be a single character"
+      shift
+      ;;
+    --data-file)
+      (($# >= 2)) || die "$1 requires a value"
+      data_file=$2
+      shift 2
+      ;;
+    --data-file=*)
+      data_file=${1#*=}
+      shift
+      ;;
+    --range)
+      (($# >= 2)) || die "$1 requires FIELD:LOW:HIGH"
+      value=$2
+      field=${value%%:*}
+      rest=${value#*:}
+      [[ "$field" != "$value" && "$field" =~ ^[1-9][0-9]*$ ]] || die "invalid range: $value"
+      low=${rest%%:*}
+      high=${rest#*:}
+      [[ "$high" != "$rest" ]] || die "invalid range: $value"
+      range_fields+=("$field")
+      range_lows+=("$low")
+      range_highs+=("$high")
+      shift 2
+      ;;
+    --range=*)
+      value=${1#*=}
+      field=${value%%:*}
+      rest=${value#*:}
+      [[ "$field" != "$value" && "$field" =~ ^[1-9][0-9]*$ ]] || die "invalid range: $value"
+      low=${rest%%:*}
+      high=${rest#*:}
+      [[ "$high" != "$rest" ]] || die "invalid range: $value"
+      range_fields+=("$field")
+      range_lows+=("$low")
+      range_highs+=("$high")
+      shift
+      ;;
+    --header)
+      print_header=1
+      shift
+      ;;
+    --quiet)
+      quiet=1
+      shift
+      ;;
+    --help)
+      usage
+      exit 0
+      ;;
+    -*)
+      die "unknown option: $1"
+      ;;
+    *)
+      [[ -z "$tree" ]] || die "expected exactly one tree directory"
+      tree=$1
+      shift
+      ;;
+  esac
+done
+
+[[ -n "$tree" ]] || die "expected a tree directory"
+[[ -d "$tree" ]] || die "tree directory not found: $tree"
+((${#range_fields[@]} > 0)) || die "at least one --range is required"
+
+awk_fields=$(join_values $'\t' "${range_fields[@]}")
+awk_lows=$(join_values $'\t' "${range_lows[@]}")
+awk_highs=$(join_values $'\t' "${range_highs[@]}")
+awk_nums=
+for field in "${range_fields[@]}"; do
+  numeric=0
+  if [[ -f "$tree/sort.keys" ]]; then
+    while IFS= read -r keydef; do
+      if [[ "$(key_field "$keydef")" == "$field" ]]; then
+        if key_is_numeric "$keydef"; then
+          numeric=1
+        fi
+        break
+      fi
+    done < "$tree/sort.keys"
+  fi
+  if [[ -z "$awk_nums" ]]; then
+    awk_nums=$numeric
+  else
+    awk_nums+=$'\t'"$numeric"
+  fi
+done
+
+if [[ "$print_header" -eq 1 && -f "$tree/header" ]]; then
+  sed -n '1p' "$tree/header"
+fi
+
+visited_nodes=1
+pruned_nodes=0
+scanned_leaves=0
+search_node "$tree"
+
+if [[ "$quiet" -eq 0 ]]; then
+  printf 'visited_nodes=%s pruned_nodes=%s scanned_leaves=%s\n' "$visited_nodes" "$pruned_nodes" "$scanned_leaves" >&2
+fi

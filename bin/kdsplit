@@ -1,0 +1,514 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+program_name=$(basename "$0")
+
+usage() {
+  cat <<'EOF'
+Usage:
+  kdsplit [KDSPLIT_OPTIONS] SORT_OPTIONS -k KEYDEF [-k KEYDEF ...] FILE
+
+Recursively split a delimited file into a kd-order directory tree.
+
+Kdsplit options:
+  -O, --output-dir DIR   Root output directory (default: FILE without suffix).
+      --min-rows N       Stop recursion at or below this row count (default: 1024).
+  -D, --max-depth N      Stop after this depth, where root is depth 0 (default: 8).
+      --parallel-depth N Process both split halves concurrently for this many
+                         levels, then recurse serially (default: 1).
+      --header           Treat the first input row as a header. Store it at
+                         TREE/header and exclude it from split data.
+      --file-name NAME   Data file name inside each tree node (default: data).
+      --quiet            Suppress progress messages.
+      --help             Show this help.
+
+GNU sort options:
+  -k, --key KEYDEF       Sort key definition, using GNU sort syntax. Repeat for
+                         multiple keys. These keys are rotated at each level.
+  -t, --field-separator  Field delimiter for GNU sort and median extraction
+                         (default: tab).
+
+Other GNU sort switches are passed to GNU sort unchanged. GNU sort -o/--output
+is not allowed because kdsplit controls node output files.
+
+The input is treated as raw delimited records with no header and no CSV quoting.
+GNU sort and GNU split are required. On macOS, gsort and gsplit are accepted.
+EOF
+}
+
+die() {
+  printf '%s: %s\n' "$program_name" "$*" >&2
+  exit 1
+}
+
+log() {
+  if [[ "$quiet" -eq 0 ]]; then
+    printf '%s\n' "$*" >&2
+  fi
+}
+
+is_gnu_tool() {
+  "$1" --version 2>/dev/null | head -n 1 | grep -q 'GNU coreutils'
+}
+
+find_gnu_tool() {
+  local preferred=$1
+  local fallback=$2
+
+  if command -v "$preferred" >/dev/null 2>&1 && is_gnu_tool "$preferred"; then
+    command -v "$preferred"
+    return
+  fi
+
+  if command -v "$fallback" >/dev/null 2>&1 && is_gnu_tool "$fallback"; then
+    command -v "$fallback"
+    return
+  fi
+
+  die "GNU $fallback is required; install coreutils or set PATH to include $preferred"
+}
+
+file_size() {
+  if stat -c '%s' "$1" >/dev/null 2>&1; then
+    stat -c '%s' "$1"
+  else
+    stat -f '%z' "$1"
+  fi
+}
+
+line_count() {
+  wc -l < "$1" | tr -d '[:space:]'
+}
+
+join_values() {
+  local sep=$1
+  shift
+  local out=
+  local item
+
+  for item in "$@"; do
+    if [[ -z "$out" ]]; then
+      out=$item
+    else
+      out+="${sep}${item}"
+    fi
+  done
+  printf '%s' "$out"
+}
+
+rotate_values() {
+  local first=$1
+  shift
+
+  if (($# == 0)); then
+    printf '%s\n' "$first"
+  else
+    printf '%s\n' "$@" "$first"
+  fi
+}
+
+sanitize_name() {
+  local value=$1
+
+  if [[ -z "$value" ]]; then
+    value=EMPTY
+  fi
+
+  value=${value//[^A-Za-z0-9._-]/_}
+  value=${value##_}
+  value=${value%%_}
+
+  if [[ -z "$value" ]]; then
+    value=VALUE
+  fi
+
+  printf '%.80s' "$value"
+}
+
+key_field() {
+  local keydef=$1
+  local start=${keydef%%,*}
+
+  if [[ "$start" =~ ^([0-9]+) ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+  else
+    die "cannot extract starting field from GNU sort key: $keydef"
+  fi
+}
+
+field_value() {
+  local file=$1
+  local field=$2
+  local line
+
+  IFS= read -r line < "$file" || return 1
+  printf '%s\n' "$line" | cut -d "$delimiter" -f "$field"
+}
+
+requires_sort_arg() {
+  case "$1" in
+    -S|-T|--batch-size|--buffer-size|--compress-program|--parallel|--random-source|--temporary-directory)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+reject_sort_output() {
+  case "$1" in
+    -o|--output|--output=*)
+      die "GNU sort -o/--output cannot be used; kdsplit controls node output files"
+      ;;
+  esac
+}
+
+run_node() {
+  local input=$1
+  local out_dir=$2
+  local depth=$3
+  shift 3
+  local keydefs=("$@")
+
+  [[ -f "$input" ]] || die "input file not found: $input"
+  mkdir -p "$out_dir"
+
+  local node_data="$out_dir/$data_name"
+  local sorted_tmp="$out_dir/.${data_name}.sorted.$$"
+  local key_args=()
+
+  local keydef
+  for keydef in "${keydefs[@]}"; do
+    key_args+=(--key "$keydef")
+  done
+
+  log "depth=$depth sort keys=$(join_values ' ' "${keydefs[@]}") $input -> $out_dir"
+  "$sort_bin" "${sort_args[@]}" "${key_args[@]}" --output="$sorted_tmp" "$input"
+  mv "$sorted_tmp" "$node_data"
+  printf '%s\n' "${keydefs[@]}" > "$out_dir/sort.keys"
+
+  local bytes
+  local lines
+  bytes=$(file_size "$node_data")
+  lines=$(line_count "$node_data")
+
+  if (( depth >= max_depth )); then
+    printf 'status=leaf\nreason=max-depth\nbytes=%s\nlines=%s\n' "$bytes" "$lines" > "$out_dir/split.meta"
+    return
+  fi
+
+  if (( lines <= min_rows )); then
+    printf 'status=leaf\nreason=min-rows\nbytes=%s\nlines=%s\n' "$bytes" "$lines" > "$out_dir/split.meta"
+    return
+  fi
+
+  if (( lines < 2 )); then
+    printf 'status=leaf\nreason=min-lines\nbytes=%s\nlines=%s\n' "$bytes" "$lines" > "$out_dir/split.meta"
+    return
+  fi
+
+  local split_tmp="$out_dir/.split.$$"
+  mkdir -p "$split_tmp"
+  "$split_bin" -n l/2 -d -a 1 "$node_data" "$split_tmp/part."
+
+  local left="$split_tmp/part.0"
+  local right="$split_tmp/part.1"
+  [[ -s "$left" && -s "$right" ]] || die "split did not produce two non-empty parts for $node_data"
+
+  local split_keydef=${keydefs[0]}
+  local split_field
+  split_field=$(key_field "$split_keydef")
+  local median
+  median=$(field_value "$right" "$split_field")
+  local median_name
+  median_name=$(sanitize_name "$median")
+
+  local left_dir="$out_dir/k${split_field}_left_${median_name}"
+  local right_dir="$out_dir/k${split_field}_right_${median_name}"
+  mkdir -p "$left_dir" "$right_dir"
+  mv "$left" "$left_dir/$data_name"
+  mv "$right" "$right_dir/$data_name"
+  rmdir "$split_tmp"
+
+  local next_keydefs=()
+  mapfile -t next_keydefs < <(rotate_values "${keydefs[@]}")
+  local next_key_args=()
+  for keydef in "${next_keydefs[@]}"; do
+    next_key_args+=(--key "$keydef")
+  done
+  local next_parallel_depth=0
+  local split_mode=serial
+  if (( parallel_depth > 0 )); then
+    next_parallel_depth=$((parallel_depth - 1))
+    split_mode=parallel
+  fi
+
+  printf 'status=split\nmode=%s\nparallel_depth=%s\nkey_field=%s\nkeydef=%s\nmedian=%s\nbytes=%s\nlines=%s\nleft=%s\nright=%s\nnext_keys=%s\n' \
+    "$split_mode" "$parallel_depth" "$split_field" "$split_keydef" "$median" "$bytes" "$lines" "$(basename "$left_dir")" "$(basename "$right_dir")" "$(join_values ' ' "${next_keydefs[@]}")" \
+    > "$out_dir/split.meta"
+
+  local child_args=(
+    --internal-node
+    --min-rows "$min_rows"
+    --max-depth "$max_depth"
+    --parallel-depth "$next_parallel_depth"
+    --file-name "$data_name"
+    --depth "$((depth + 1))"
+  )
+  if [[ -n "$quiet_flag" ]]; then
+    child_args+=("$quiet_flag")
+  fi
+
+  if (( parallel_depth > 0 )); then
+    (
+      cd "$left_dir"
+      "$script_path" "${child_args[@]}" "${sort_args[@]}" "${next_key_args[@]}" -- "$data_name"
+    ) &
+    local left_pid=$!
+
+    (
+      cd "$right_dir"
+      "$script_path" "${child_args[@]}" "${sort_args[@]}" "${next_key_args[@]}" -- "$data_name"
+    ) &
+    local right_pid=$!
+
+    local status=0
+    wait "$left_pid" || status=$?
+    wait "$right_pid" || status=$?
+    return "$status"
+  fi
+
+  (
+    cd "$left_dir"
+    "$script_path" "${child_args[@]}" "${sort_args[@]}" "${next_key_args[@]}" -- "$data_name"
+  )
+  (
+    cd "$right_dir"
+    "$script_path" "${child_args[@]}" "${sort_args[@]}" "${next_key_args[@]}" -- "$data_name"
+  )
+}
+
+output_dir=
+min_rows=1024
+max_depth=8
+parallel_depth=1
+header=0
+data_name=data
+depth=0
+quiet=0
+quiet_flag=
+internal_node=0
+delimiter=$'\t'
+field_separator_seen=0
+sort_args=()
+keydefs=()
+input_files=()
+
+while (($# > 0)); do
+  case "$1" in
+    -O|--output-dir|--root)
+      (($# >= 2)) || die "$1 requires a value"
+      output_dir=$2
+      shift 2
+      ;;
+    --output-dir=*|--root=*)
+      output_dir=${1#*=}
+      shift
+      ;;
+    --min-rows)
+      (($# >= 2)) || die "$1 requires a value"
+      [[ "$2" =~ ^[0-9]+$ ]] || die "--min-rows must be a non-negative integer"
+      min_rows=$2
+      shift 2
+      ;;
+    --min-rows=*)
+      min_rows=${1#*=}
+      [[ "$min_rows" =~ ^[0-9]+$ ]] || die "--min-rows must be a non-negative integer"
+      shift
+      ;;
+    -D|--max-depth)
+      (($# >= 2)) || die "$1 requires a value"
+      [[ "$2" =~ ^[0-9]+$ ]] || die "--max-depth must be a non-negative integer"
+      max_depth=$2
+      shift 2
+      ;;
+    --max-depth=*)
+      max_depth=${1#*=}
+      [[ "$max_depth" =~ ^[0-9]+$ ]] || die "--max-depth must be a non-negative integer"
+      shift
+      ;;
+    --parallel-depth)
+      (($# >= 2)) || die "$1 requires a value"
+      [[ "$2" =~ ^[0-9]+$ ]] || die "--parallel-depth must be a non-negative integer"
+      parallel_depth=$2
+      shift 2
+      ;;
+    --parallel-depth=*)
+      parallel_depth=${1#*=}
+      [[ "$parallel_depth" =~ ^[0-9]+$ ]] || die "--parallel-depth must be a non-negative integer"
+      shift
+      ;;
+    --header)
+      header=1
+      shift
+      ;;
+    --file-name)
+      (($# >= 2)) || die "$1 requires a value"
+      data_name=$2
+      [[ "$data_name" != */* && -n "$data_name" ]] || die "--file-name must be a plain file name"
+      shift 2
+      ;;
+    --file-name=*)
+      data_name=${1#*=}
+      [[ "$data_name" != */* && -n "$data_name" ]] || die "--file-name must be a plain file name"
+      shift
+      ;;
+    --depth)
+      (($# >= 2)) || die "$1 requires a value"
+      [[ "$2" =~ ^[0-9]+$ ]] || die "--depth must be a non-negative integer"
+      depth=$2
+      shift 2
+      ;;
+    --depth=*)
+      depth=${1#*=}
+      [[ "$depth" =~ ^[0-9]+$ ]] || die "--depth must be a non-negative integer"
+      shift
+      ;;
+    --internal-node)
+      internal_node=1
+      shift
+      ;;
+    --quiet)
+      quiet=1
+      quiet_flag=--quiet
+      shift
+      ;;
+    --help)
+      usage
+      exit 0
+      ;;
+    -k|--key)
+      (($# >= 2)) || die "$1 requires a GNU sort key definition"
+      keydefs+=("$2")
+      shift 2
+      ;;
+    -k?*)
+      keydefs+=("${1#-k}")
+      shift
+      ;;
+    --key=*)
+      keydefs+=("${1#--key=}")
+      shift
+      ;;
+    -t|--field-separator)
+      (($# >= 2)) || die "$1 requires a delimiter"
+      delimiter=$2
+      [[ ${#delimiter} -eq 1 ]] || die "field separator must be a single character"
+      field_separator_seen=1
+      sort_args+=("$1" "$2")
+      shift 2
+      ;;
+    -t?*)
+      delimiter=${1#-t}
+      [[ ${#delimiter} -eq 1 ]] || die "field separator must be a single character"
+      field_separator_seen=1
+      sort_args+=("$1")
+      shift
+      ;;
+    --field-separator=*)
+      delimiter=${1#--field-separator=}
+      [[ ${#delimiter} -eq 1 ]] || die "field separator must be a single character"
+      field_separator_seen=1
+      sort_args+=("$1")
+      shift
+      ;;
+    -o|--output|--output=*)
+      reject_sort_output "$1"
+      ;;
+    --)
+      shift
+      input_files+=("$@")
+      break
+      ;;
+    -*)
+      reject_sort_output "$1"
+      if requires_sort_arg "$1"; then
+        (($# >= 2)) || die "$1 requires an argument"
+        sort_args+=("$1" "$2")
+        shift 2
+      else
+        sort_args+=("$1")
+        shift
+      fi
+      ;;
+    *)
+      input_files+=("$1")
+      shift
+      ;;
+  esac
+done
+
+((${#input_files[@]} == 1)) || die "expected exactly one input file"
+((${#keydefs[@]} > 0)) || die "at least one GNU sort -k/--key definition is required"
+
+if [[ "$field_separator_seen" -eq 0 ]]; then
+  sort_args=("-t" "$delimiter" "${sort_args[@]}")
+fi
+
+for keydef in "${keydefs[@]}"; do
+  key_field "$keydef" >/dev/null
+done
+
+sort_bin=${GSORT:-}
+split_bin=${GSPLIT:-}
+
+if [[ -n "$sort_bin" ]]; then
+  is_gnu_tool "$sort_bin" || die "GSORT does not point to GNU sort: $sort_bin"
+else
+  sort_bin=$(find_gnu_tool gsort sort)
+fi
+
+if [[ -n "$split_bin" ]]; then
+  is_gnu_tool "$split_bin" || die "GSPLIT does not point to GNU split: $split_bin"
+else
+  split_bin=$(find_gnu_tool gsplit split)
+fi
+
+script_path=${BASH_SOURCE[0]}
+if [[ "$script_path" != /* ]]; then
+  script_path=$(cd "$(dirname "$script_path")" && pwd)/$(basename "$script_path")
+fi
+
+input_file=${input_files[0]}
+
+if [[ -z "$output_dir" ]]; then
+  if [[ "$internal_node" -eq 1 ]]; then
+    output_dir=.
+  else
+    base=$(basename "$input_file")
+    output_dir=${base%.*}
+    [[ -n "$output_dir" ]] || output_dir=$base
+  fi
+fi
+
+if [[ "$internal_node" -eq 0 && -d "$output_dir" ]]; then
+  if [[ -n $(find "$output_dir" -mindepth 1 -print -quit) ]]; then
+    die "output directory already exists and is not empty: $output_dir"
+  fi
+fi
+
+if [[ "$header" -eq 1 && "$internal_node" -eq 0 ]]; then
+  mkdir -p "$output_dir"
+  IFS= read -r header_line < "$input_file" || die "input file is empty: $input_file"
+  printf '%s\n' "$header_line" > "$output_dir/header"
+  body_tmp="$output_dir/.input.body.$$"
+  tail -n +2 "$input_file" > "$body_tmp"
+  input_file=$body_tmp
+fi
+
+run_node "$input_file" "$output_dir" "$depth" "${keydefs[@]}"
+
+if [[ "${body_tmp:-}" != "" ]]; then
+  rm -f "$body_tmp"
+fi

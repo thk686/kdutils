@@ -1,0 +1,10 @@
+benchmark,real,user,sys
+build,real=5.28,user=6.77,sys=3.36
+kdsearch_summer_lax,real=0.64,user=0.36,sys=0.18
+awk_summer_lax,real=0.71,user=0.70,sys=0.00
+kdsearch_january,real=0.51,user=0.33,sys=0.11
+awk_january,real=0.69,user=0.68,sys=0.00
+kdsearch_midmonth,real=1.15,user=0.72,sys=0.29
+awk_midmonth,real=0.73,user=0.72,sys=0.01
+kdsearch_summer_lax_midmonth,real=0.49,user=0.24,sys=0.15
+awk_summer_lax_midmonth,real=0.69,user=0.69,sys=0.00

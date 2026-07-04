@@ -1,0 +1,4 @@
+summer_lax	2:6:8	14:LAX:LAX
+january	2:1:1
+midmonth	3:10:20
+summer_lax_midmonth	2:6:8	3:10:20	14:LAX:LAX

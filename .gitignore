@@ -1,0 +1,4 @@
+benchmarks/*/tree/
+benchmarks/*/*.out
+benchmarks/*/*.time
+benchmarks/*/node_rows.txt
