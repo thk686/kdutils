@@ -2,6 +2,14 @@
 
 Command line utilities for partitioning and searching large tabular files.
 
+These tools are aimed at very large delimited files where a one-time external
+GNU sort based partitioning pass can pay for repeated range queries. They are
+not especially useful for small files; direct GNU `sort`, `awk`, `grep`, or a
+single scan will often be simpler and faster. `kdsplit` intentionally delegates
+the hard out-of-core work to GNU sort and avoids persistent per-level data
+copies, but active splits still need temporary working space for GNU sort and
+GNU split.
+
 ## `kdsplit`
 
 `bin/kdsplit` recursively splits a delimited file into a kd-order directory
