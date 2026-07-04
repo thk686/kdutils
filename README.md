@@ -24,7 +24,9 @@ Top-level runs refuse to write into a non-empty output directory so old branches
 are not accidentally mixed with a new partitioning run.
 
 Use `--header` when the input has a header row. The header is stored as
-`TREE/header` and excluded from all node `data` files.
+`TREE/header` and excluded from all node `data` files. Header removal is
+streamed into the root sort; `kdsplit` does not materialize a full headerless
+copy of the input.
 
 By default, only the root split runs its two children concurrently. Use
 `--parallel-depth 0` for fully serial recursion, or a larger value to allow
@@ -48,11 +50,17 @@ then `-k 3,3 -k 1,1 -k 2,2`, then back to the original order.
 
 Each tree node contains:
 
-- `data`: the node's sorted records.
 - `sort.keys`: the key order used at that node.
 - `split.meta`: split metadata, or the leaf stop reason.
 
-The input is treated as raw delimited records with no header and no CSV quoting.
+Only leaf nodes retain `data` files. Internal node data is removed immediately
+after it has been split into child partitions, so the persistent tree stores one
+copy of each input row rather than one copy per level. During a split, GNU sort
+and GNU split still need temporary working space for the partition currently
+being processed. Child partitions are sorted in place before being split, while
+the root input file is never overwritten.
+
+The input is treated as raw delimited records with no CSV quoting.
 
 A future `kdmerge` utility could traverse this tree depth-first and concatenate
 the node files back into kd-order, except for the lowest leaves where records

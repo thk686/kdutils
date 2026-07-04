@@ -175,7 +175,7 @@ run_node() {
   mkdir -p "$out_dir"
 
   local node_data="$out_dir/$data_name"
-  local sorted_tmp="$out_dir/.${data_name}.sorted.$$"
+  local sorted_file="$input"
   local key_args=()
 
   local keydef
@@ -184,33 +184,50 @@ run_node() {
   done
 
   log "depth=$depth sort keys=$(join_values ' ' "${keydefs[@]}") $input -> $out_dir"
-  "$sort_bin" "${sort_args[@]}" "${key_args[@]}" --output="$sorted_tmp" "$input"
-  mv "$sorted_tmp" "$node_data"
+  if [[ "$internal_node" -eq 0 ]]; then
+    sorted_file="$out_dir/.${data_name}.sorted.$$"
+    if [[ "$header" -eq 1 ]]; then
+      tail -n +2 "$input" | "$sort_bin" "${sort_args[@]}" "${key_args[@]}" --output="$sorted_file"
+    else
+      "$sort_bin" "${sort_args[@]}" "${key_args[@]}" --output="$sorted_file" "$input"
+    fi
+  else
+    "$sort_bin" "${sort_args[@]}" "${key_args[@]}" --output="$input" "$input"
+  fi
   printf '%s\n' "${keydefs[@]}" > "$out_dir/sort.keys"
 
   local bytes
   local lines
-  bytes=$(file_size "$node_data")
-  lines=$(line_count "$node_data")
+  bytes=$(file_size "$sorted_file")
+  lines=$(line_count "$sorted_file")
 
   if (( depth >= max_depth )); then
+    if [[ "$sorted_file" != "$node_data" ]]; then
+      mv "$sorted_file" "$node_data"
+    fi
     printf 'status=leaf\nreason=max-depth\nbytes=%s\nlines=%s\n' "$bytes" "$lines" > "$out_dir/split.meta"
     return
   fi
 
   if (( lines <= min_rows )); then
+    if [[ "$sorted_file" != "$node_data" ]]; then
+      mv "$sorted_file" "$node_data"
+    fi
     printf 'status=leaf\nreason=min-rows\nbytes=%s\nlines=%s\n' "$bytes" "$lines" > "$out_dir/split.meta"
     return
   fi
 
   if (( lines < 2 )); then
+    if [[ "$sorted_file" != "$node_data" ]]; then
+      mv "$sorted_file" "$node_data"
+    fi
     printf 'status=leaf\nreason=min-lines\nbytes=%s\nlines=%s\n' "$bytes" "$lines" > "$out_dir/split.meta"
     return
   fi
 
   local split_tmp="$out_dir/.split.$$"
   mkdir -p "$split_tmp"
-  "$split_bin" -n l/2 -d -a 1 "$node_data" "$split_tmp/part."
+  "$split_bin" -n l/2 -d -a 1 "$sorted_file" "$split_tmp/part."
 
   local left="$split_tmp/part.0"
   local right="$split_tmp/part.1"
@@ -230,6 +247,7 @@ run_node() {
   mv "$left" "$left_dir/$data_name"
   mv "$right" "$right_dir/$data_name"
   rmdir "$split_tmp"
+  rm -f "$sorted_file"
 
   local next_keydefs=()
   mapfile -t next_keydefs < <(rotate_values "${keydefs[@]}")
@@ -502,13 +520,6 @@ if [[ "$header" -eq 1 && "$internal_node" -eq 0 ]]; then
   mkdir -p "$output_dir"
   IFS= read -r header_line < "$input_file" || die "input file is empty: $input_file"
   printf '%s\n' "$header_line" > "$output_dir/header"
-  body_tmp="$output_dir/.input.body.$$"
-  tail -n +2 "$input_file" > "$body_tmp"
-  input_file=$body_tmp
 fi
 
 run_node "$input_file" "$output_dir" "$depth" "${keydefs[@]}"
-
-if [[ "${body_tmp:-}" != "" ]]; then
-  rm -f "$body_tmp"
-fi

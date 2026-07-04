@@ -81,7 +81,7 @@ while IFS=$'\t' read -r name r1 r2 r3; do
   rm -f "$out_dir/kdsearch_$name.out" "$out_dir/awk_$name.out"
 done < "$out_dir/queries.tsv"
 
-find "$tree" -name data -exec wc -l {} + > "$out_dir/node_rows.txt"
+find "$tree" -name data -exec sh -c 'for file do printf "%s %s\n" "$(wc -l < "$file" | tr -d "[:space:]")" "$file"; done' sh {} + > "$out_dir/node_rows.txt"
 find "$tree" -name split.meta | wc -l | tr -d '[:space:]' > "$out_dir/node_count.txt"
 
 printf 'benchmark_dir=%s\n' "$out_dir"
